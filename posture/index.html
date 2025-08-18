@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Slouch Detector</title>
+
+  <!-- ✅ Pinned versions (stable) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet@2.2.2/dist/posenet.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+      text-align: center;
+      background-color: #f0f4f8;
+      color: #1a202c;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+
+    h1 {
+      color: #2d3748;
+      margin-bottom: 1.5rem;
+    }
+
+    #video-container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    }
+
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1); /* Mirror for natural view */
+    }
+
+    #status {
+      margin-top: 1.5rem;
+      padding: 1rem 2rem;
+      background-color: #ffffff;
+      border-radius: 12px;
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: #2d3748;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+      transition: all 0.3s ease;
+    }
+
+    #status.good { color: #2f855a; }  /* Green */
+    #status.bad { color: #c53030; }   /* Red */
+
+    @media (max-width: 768px) {
+      #video-container {
+        width: 90vw;
+        height: calc(90vw * 0.75);
+      }
+      #status { font-size: 1.25rem; }
+    }
+  </style>
+</head>
+<body>
+  <h1>🧍 Slouch Detector</h1>
+  <div id="video-container">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="canvas"></canvas>
+  </div>
+  <div id="status">Loading...</div>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    let net = null;
+
+    async function setupCamera() {
+      try {
+        video.width = 640;
+        video.height = 480;
+        canvas.width = 640;
+        canvas.height = 480;
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 },
+          audio: false
+        });
+
+        video.srcObject = stream;
+        return new Promise(resolve => {
+          video.onloadedmetadata = () => resolve(video);
+        });
+      } catch (error) {
+        console.error("Camera setup error:", error);
+        statusEl.textContent = "❌ Camera error: " + error.message;
+      }
+    }
+
+    function drawKeypoints(pose, postureState) {
+      if (!pose || !pose.keypoints) return;
+      const color = postureState === "good" ? "lime" : "red";
+      pose.keypoints.forEach(keypoint => {
+        if (keypoint.score > 0.5) {
+          const { x, y } = keypoint.position;
+          ctx.beginPath();
+          ctx.arc(x, y, 6, 0, 2 * Math.PI);
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+      });
+    }
+
+    function drawSkeleton(keypoints, postureState) {
+      if (!posenet) return;
+      const adjacentKeyPoints = posenet.getAdjacentKeyPoints(keypoints, 0.5);
+      const color = postureState === "good" ? "lime" : "red";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      adjacentKeyPoints.forEach(([start, end]) => {
+        if (start.score > 0.5 && end.score > 0.5) {
+          ctx.beginPath();
+          ctx.moveTo(start.position.x, start.position.y);
+          ctx.lineTo(end.position.x, end.position.y);
+          ctx.stroke();
+        }
+      });
+    }
+
+    function checkPosture(pose) {
+      const leftShoulder = pose.keypoints.find(k => k.part === "leftShoulder");
+      const rightShoulder = pose.keypoints.find(k => k.part === "rightShoulder");
+      const nose = pose.keypoints.find(k => k.part === "nose");
+      const leftEar = pose.keypoints.find(k => k.part === "leftEar");
+      const rightEar = pose.keypoints.find(k => k.part === "rightEar");
+      if (!leftShoulder || !rightShoulder || !nose || !leftEar || !rightEar) {
+        return "undetected";
+      }
+      const shoulderLineY = (leftShoulder.position.y + rightShoulder.position.y) / 2;
+      const verticalDistance = nose.position.y - shoulderLineY;
+      const verticalThreshold = 5;
+      const avgShoulderX = (leftShoulder.position.x + rightShoulder.position.x) / 2;
+      const avgEarX = (leftEar.position.x + rightEar.position.x) / 2;
+      const headForwardDistance = Math.abs(avgEarX - avgShoulderX);
+      const headForwardThreshold = 10;
+      if (verticalDistance > verticalThreshold || headForwardDistance > headForwardThreshold) {
+        return "bad";
+      }
+      return "good";
+    }
+
+    async function detect() {
+      if (!net) {
+        // Fallback: just display webcam
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        statusEl.textContent = "⚠️ PoseNet failed to load. Webcam only.";
+        requestAnimationFrame(detect);
+        return;
+      }
+      const pose = await net.estimateSinglePose(video, { flipHorizontal: true });
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      let postureState = "undetected";
+      if (pose && pose.score > 0.2) {
+        postureState = checkPosture(pose);
+        drawKeypoints(pose, postureState);
+        drawSkeleton(pose.keypoints, postureState);
+      }
+      statusEl.textContent =
+        postureState === "good" ? "✅ Good posture!" :
+        postureState === "bad" ? "⚠️ Bad posture!" :
+        "⚠️ Can't detect properly";
+      statusEl.className = postureState;
+      requestAnimationFrame(detect);
+    }
+
+    async function run() {
+      statusEl.textContent = "📷 Loading webcam...";
+      const videoElement = await setupCamera();
+      if (videoElement) {
+        await videoElement.play();
+        try {
+          statusEl.textContent = "🤖 Loading PoseNet model...";
+          net = await posenet.load();
+          console.log("✅ PoseNet loaded.");
+          statusEl.textContent = "Model loaded. Detecting posture...";
+        } catch (err) {
+          console.error("PoseNet load failed:", err);
+          net = null;
+        }
+        detect();
+      } else {
+        statusEl.textContent = "❌ Webcam setup failed.";
+      }
+    }
+
+    window.onload = run;
+  </script>
+</body>
+</html>
